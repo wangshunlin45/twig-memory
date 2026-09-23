@@ -47,7 +47,12 @@
 - 09-23 09:37：**第三次宕机抢修完成，全程 76 分钟**。/health 09:33 回 200 → 自检 **7/7 PASS**（首跑 6/7 系索引预热抖动，20 秒后重跑全绿；token 取自 service variables API——教训：Python `open('/tmp/...')` 在 Windows 会落到盘符根目录的 \tmp，自检要用 bash 写入的 /tmp 文件）→ 评测页「**一键续跑最近中断任务**」→ 确定（保持原 dispatch ID）→ 运行中，检索 **52.3%**，断点进度全保住
 - 09-23 12:33：定时检查。运行中，检索 55.9%（速度较昨夜放缓：重启后缓存全冷 + 断点重放 add）。日志旁证服务在真实工作（12:34 仍在出 `/aml/search` 200），但抓到一条 **25 分钟级 search 尾延迟**（1510129ms）+ zeaburlet 监控代理再次失联（isOnline=false，App 本身正常）——列入观察项，加设 14:03 一次性复查
 - 09-23 13:34：第四次失败（**`ADD_RUNTIME_ERROR`**，25h10m）。14:03 复查抓到。**根因链（代码级实锤）**：① `buildUserIndex` 无 in-flight 去重——同 shard 并发 search 各自全量重嵌（日志 4 条同秒重复 embed 即此）；② 查询向量臂 `embedTexts([query], shardId)` 每搜一次就把整个 shard 缓存（万条级 ≈ 200MB JSON）同步 stringify+重写——25/40 分钟 search 尾延迟与事件循环饿死的直接元凶；③ shardStores 无界驻留 + indexCache 上限 100（万条 shard 单个 ~100MB）→ 慢速 OOM。平台视角：add 请求排不上事件循环 → 超时报 ADD_RUNTIME_ERROR。**热修复（行为零变化，本地实测）**：`buildUserIndex` 加 per-user in-flight 共享 + 构建并发闸门 3（`AML_INDEX_BUILD_CONCURRENCY`）；`saveShard` 节流到 10s + 构建结束强制落盘 + `releaseShard` 释放内存驻留；查询向量改走 `embedQuery`（纯内存 LRU 512，同 API 同模型结果一致，不进分片缓存）；Zeabur 加配 `AML_INDEX_CACHE_MAX=12`（原默认 100 对万条 shard 太肥）。本地验证：6 并发同 user 只嵌 1 次、结果一致；增量 add 10 条只嵌 10 条；重复查询 16ms
+- 09-23 14:45：抢修准备期间服务器**第四次断气**（isOnline=false；评测平台失败任务的余量搜索请求把冷 shard 并发嵌入又打爆了）→ rebootServer 第四次 → 14:45 回 RUNNING → 推送 `00c1aca`（含上述热修复与本日志）触发自动构建 → 加配 `AML_INDEX_CACHE_MAX=12`（updateEnvironmentVariable；注意 createEnvironmentVariable 对新 key 会 500，用 update 那个）→ 待部署完成后自检 + 断点续跑
+- 09-23 15:15：**自伤事故**——`updateEnvironmentVariable` 实为全量替换，17 个环境变量被清空，新部署起来跑成默认入口 http.ts（8080 无鉴权）→ 502。抢救：旧会话 wire.jsonl 里找回 AML_AUTH_TOKEN（`~/.kimi-code/sessions/.../wire.jsonl` 搜 `a5dd[0-9a-f]{30,60}`），从 `.env.local` 取 MUNINN 三件套 + SF_API_KEY，`executeCommand ls /data` 确认数据卷完好（embed-cache/ 还在），按原清单全量重建 17 项（PASSWORD、PORT 两项无法复原：PASSWORD 代码里无引用，弃；PORT 原值疑似无效插值，aml.ts 回退 7301 即可）→ restartService 恢复正轨
+- 09-23 15:41：**第四次宕机全线恢复，热修复上线生产验证通过**。补上 `PORT=7301`（Zeabur 注入的 PORT=8080 会让 aml.ts 监听错位端口 → 502；原 `${WE...}` 是无效插值回退 7301）→ /health 秒回 200 → 自检 **7/7 PASS**。任务已被续跑（14:07–15:36 间由她/另一会话触发，断点自 55.9% 起），运行中，检索 59.2% 推进中。生产数据：search **3~7s**（25/40 分钟级尾延迟消失）、add 65~774ms、内存 1708/3499MB。**教训备份**：改环境变量前必先全量导出 `variables` 再提交完整 Map
+- ⚠️ **评测期间严禁 `git push origin main`**：任何 push 都会触发自动构建+重启服务。worklog 的后续修改只本地 commit，赛后再推（待办见第六节）
 - 09-23 12:31：定时检查。/health 直连 200（1.0s）。检索 55.9%（续跑后 +3.5pt/2.9h，节奏放慢但持续推进），无异常
+- 09-23 15:37：定时检查接力收尾。确认 15:15 环境变量事故已救回（/health 直连+代理双 200、自检 **7/7 PASS**，鉴权/入口均正确）；服务跑在 `00c1aca`，内存 1857/3499（53%，较修复前 62% 下降）。评测页断点续跑 → **运行中，检索 59.1%**（原 dispatch ID，开始时间 09-22 12:23:42 未变，断点保住）。新教训：cron 撞见 502/失败时若是并行窗口正在热更或修配，**别 rebootServer**——先查 deployments API 确认无进行中部署再按手册走
 
 ## 五、运维手册（下次出事照着做）
 
@@ -61,6 +66,8 @@
 **注意**：本机 curl 服务器可能超时（她本机→阿里云香港的路由时好时坏），**以评测页进度为准**，别被本地探测骗了。GitHub/npm 直连不通时用代理 `http://127.0.0.1:7890`。
 
 **API 抢修通道（09-23 验证，免开 dashboard）**：Zeabur GraphQL `https://api.zeabur.com/graphql`，`Authorization: Bearer <zat token>`（在 `~/.kimi-code/mcp.json`）。ID 固定：server `6a91ecacaf37eeef8fb27aa9` / project `6aaa9c9a905b4aaea95db29a` / env `6aaa9c9a1d7bf7f6aa4aac3e` / service `6aaa9ca4905b4aaea95db29d`。对应手册步骤：`rebootServer(_id, force:true, deploymentsToSuspend:[])`＝第 1 步（空数组＝Deselect All）；`restartService(serviceID, environmentID)`＝第 3 步 Restart；`redeployService`＝Redeploy；`rollbackDeployment` 要付费套餐，别试。状态查询：`server(_id){status{isOnline vmStatus}}`、`service(_id){status podStatuses{name status}}`、`runtimeLogs(projectID,serviceID,environmentID)`。**陷阱：任何一次构建 FAILED 后 deployment 指针会落在坏镜像上，此时 Restart 会让 Pod 卡死拉镜像——必须 redeployService 重建。**
+- **`updateEnvironmentVariable` 是全量替换不是合并**（09-23 血泪）：只传 `{AML_INDEX_CACHE_MAX:"12"}` 会把其余 17 个环境变量全部清空，服务直接退化成默认入口。改任何环境变量前，先 `service(_id){variables(environmentID){key value}}` 全量导出备份，再用完整 Map 一次性提交。`createEnvironmentVariable` 对新 key 会 500，用 `updateEnvironmentVariable`。
+- `executeCommand(serviceID, environmentID, command:["sh","-c","..."]) { exitCode output }` 可直接在容器里跑命令（查 /data 布局等），免 SSH。
 
 **未做的加固**：Zeabur Settings → Advanced → **Resource Reservation**（给 K3s 预留 CPU/内存防挤死）——评测期间不敢动，赛后配上。
 
@@ -71,6 +78,7 @@
 - [ ] **评测成功后**：记录 AVERAGE 与各能力分项 vs MemoraX 58.02；等管理员复核上公榜
 - [ ] **赛后 30 天内**：删除 Zeabur `/data` 卷里的评测数据（合规要求）
 - [ ] **赛后**：`.env.local` 里的 MUNINN_* 三件套可删（plan key 若续用则留）；`glm-5-3-flash` 测试模型可在火山控制台关闭；Resource Reservation 配上
+- [ ] **赛后**：`git push` 推送评测期间积压的本地提交（含本 worklog 更新；评测期间严禁 push main——会触发自动部署重启服务）；PASSWORD 变量若想起用途需手动补回（09-23 环境变量事故中丢失，代码无引用）
 - [ ] 可选项：官方问询邮件（Search 超时上限、作答实际用多少条记忆）→ contactus@agentmemoryleaderboard.ai 或直接回审核邮件
 
 ## 七、新窗口开场词（贴给新会话）
