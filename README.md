@@ -172,4 +172,5 @@ twig-memory/
 - [docs/新前端技术设计文档-v1.0.md](docs/新前端技术设计文档-v1.0.md) —— 记忆书前端与情感层（日记/心迹/便签/印章）设计
 - [docs/COMPLIANCE.md](docs/COMPLIANCE.md) —— 合规声明（不是医疗设备 / 情感数据最小化）
 - [docs/CRISIS-PROTOCOL.md](docs/CRISIS-PROTOCOL.md) —— 危机协议全文
+- [ATTRIBUTION.md](ATTRIBUTION.md) —— 下游署名与机制归属指南：借鉴怎么写、改名怎么对照、什么不算原创
 - [LICENSE](LICENSE) —— MIT
